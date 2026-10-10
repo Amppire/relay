@@ -158,6 +158,213 @@ func (r *SQLiteRepository) GetDomainByHostname(ctx context.Context, hostname str
 	}, nil
 }
 
+func (r *SQLiteRepository) CreateSecretLink(ctx context.Context, res *domain.Resource, link *domain.ResourceLink, secret *domain.SecretResource) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Insert resource
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO resources (
+			id, workspace_id, created_by, type, name, description, status,
+			created_at, updated_at, expires_at, max_accesses, access_count, metadata
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		res.ID.String(), res.WorkspaceID.String(), nil, string(res.Type), res.Name, res.Description,
+		string(res.Status), res.CreatedAt, res.UpdatedAt, res.ExpiresAt, res.MaxAccesses, res.AccessCount, "{}",
+	)
+	if err != nil {
+		return fmt.Errorf("insert secret resource: %w", err)
+	}
+
+	// Insert link
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO resource_links (id, resource_id, domain_id, slug, enabled, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, link.ID.String(), link.ResourceID.String(), link.DomainID.String(), link.Slug, link.Enabled, link.CreatedAt)
+	if err != nil {
+		if stringsContains(err.Error(), "UNIQUE") {
+			return domain.ErrAlreadyExists
+		}
+		return fmt.Errorf("insert secret link: %w", err)
+	}
+
+	// Insert secret_resources
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO secret_resources (
+			resource_id, ciphertext, cipher, cipher_version, nonce, wrapped_dek, salt, kdf_params, encrypted_metadata, destroy_after_read
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		secret.ResourceID.String(), secret.Ciphertext, secret.Cipher, secret.CipherVersion, secret.Nonce,
+		secret.WrappedDEK, secret.Salt, secret.KDFParams, secret.EncryptedMetadata, secret.DestroyAfterRead,
+	)
+	if err != nil {
+		return fmt.Errorf("insert secret details: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+func (r *SQLiteRepository) ResolveSecret(ctx context.Context, domainID uuid.UUID, slug string) (*ports.ResolvedSecret, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT 
+			r.id, r.workspace_id, r.type, r.name, r.status, r.created_at, r.updated_at, r.expires_at, r.revoked_at, r.max_accesses, r.access_count,
+			l.id, l.resource_id, l.domain_id, l.slug, l.enabled, l.created_at,
+			s.ciphertext, s.cipher, s.cipher_version, s.nonce, s.wrapped_dek, s.salt, s.kdf_params, s.encrypted_metadata, s.destroy_after_read, s.consumed_at
+		FROM resource_links l
+		JOIN resources r ON r.id = l.resource_id
+		JOIN secret_resources s ON s.resource_id = r.id
+		WHERE l.domain_id = ? AND l.slug = ? AND l.enabled = TRUE
+	`, domainID.String(), slug)
+
+	var (
+		rID, rWsID, rType, rStatus string
+		rName                      *string
+		rCreated, rUpdated         time.Time
+		rExpires, rRevoked         *time.Time
+		rMax                       *int64
+		rAccessCount               int64
+
+		lID, lResID, lDomID, lSlug string
+		lEnabled                   bool
+		lCreated                   time.Time
+
+		ciphertext, nonce             []byte
+		cipherName                    string
+		cipherVer                     int
+		wrappedDEK, salt, encMeta     []byte
+		kdfParams                     *string
+		destroyAfterRead              bool
+		consumedAt                    *time.Time
+	)
+
+	err := row.Scan(
+		&rID, &rWsID, &rType, &rName, &rStatus, &rCreated, &rUpdated, &rExpires, &rRevoked, &rMax, &rAccessCount,
+		&lID, &lResID, &lDomID, &lSlug, &lEnabled, &lCreated,
+		&ciphertext, &cipherName, &cipherVer, &nonce, &wrappedDEK, &salt, &kdfParams, &encMeta, &destroyAfterRead, &consumedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+
+	if consumedAt != nil {
+		return nil, domain.ErrSecretAlreadyConsumed
+	}
+
+	parsedRID, _ := uuid.Parse(rID)
+	parsedRWsID, _ := uuid.Parse(rWsID)
+	parsedLID, _ := uuid.Parse(lID)
+	parsedLDomID, _ := uuid.Parse(lDomID)
+
+	var nameStr string
+	if rName != nil {
+		nameStr = *rName
+	}
+	var kdfStr string
+	if kdfParams != nil {
+		kdfStr = *kdfParams
+	}
+
+	res := &domain.Resource{
+		ID:          parsedRID,
+		WorkspaceID: parsedRWsID,
+		Type:        domain.ResourceType(rType),
+		Name:        nameStr,
+		Status:      domain.ResourceStatus(rStatus),
+		CreatedAt:   rCreated,
+		UpdatedAt:   rUpdated,
+		ExpiresAt:   rExpires,
+		RevokedAt:   rRevoked,
+		MaxAccesses: rMax,
+		AccessCount: rAccessCount,
+	}
+
+	link := &domain.ResourceLink{
+		ID:         parsedLID,
+		ResourceID: parsedRID,
+		DomainID:   parsedLDomID,
+		Slug:       lSlug,
+		Enabled:    lEnabled,
+		CreatedAt:  lCreated,
+	}
+
+	secret := &domain.SecretResource{
+		ResourceID:        parsedRID,
+		Ciphertext:        ciphertext,
+		Cipher:            cipherName,
+		CipherVersion:     cipherVer,
+		Nonce:             nonce,
+		WrappedDEK:        wrappedDEK,
+		Salt:              salt,
+		KDFParams:         kdfStr,
+		EncryptedMetadata: encMeta,
+		DestroyAfterRead:  destroyAfterRead,
+		ConsumedAt:        consumedAt,
+	}
+
+	return &ports.ResolvedSecret{
+		Resource: res,
+		Link:     link,
+		Secret:   secret,
+	}, nil
+}
+
+// ConsumeSecret performs atomic burn-after-read update in SQL
+func (r *SQLiteRepository) ConsumeSecret(ctx context.Context, resourceID uuid.UUID) (*domain.SecretResource, error) {
+	now := time.Now().UTC()
+	row := r.db.QueryRowContext(ctx, `
+		UPDATE secret_resources
+		SET consumed_at = ?
+		WHERE resource_id = ? AND consumed_at IS NULL
+		RETURNING ciphertext, cipher, cipher_version, nonce, wrapped_dek, salt, kdf_params, encrypted_metadata, destroy_after_read, consumed_at
+	`, now, resourceID.String())
+
+	var (
+		ciphertext, nonce         []byte
+		cipherName                string
+		cipherVer                 int
+		wrappedDEK, salt, encMeta []byte
+		kdfParams                 *string
+		destroyAfterRead          bool
+		consumedAt                *time.Time
+	)
+
+	err := row.Scan(&ciphertext, &cipherName, &cipherVer, &nonce, &wrappedDEK, &salt, &kdfParams, &encMeta, &destroyAfterRead, &consumedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrSecretAlreadyConsumed
+		}
+		return nil, err
+	}
+
+	// Also mark root resource as consumed
+	_, _ = r.db.ExecContext(ctx, "UPDATE resources SET status = 'consumed' WHERE id = ?", resourceID.String())
+
+	var kdfStr string
+	if kdfParams != nil {
+		kdfStr = *kdfParams
+	}
+
+	return &domain.SecretResource{
+		ResourceID:        resourceID,
+		Ciphertext:        ciphertext,
+		Cipher:            cipherName,
+		CipherVersion:     cipherVer,
+		Nonce:             nonce,
+		WrappedDEK:        wrappedDEK,
+		Salt:              salt,
+		KDFParams:         kdfStr,
+		EncryptedMetadata: encMeta,
+		DestroyAfterRead:  destroyAfterRead,
+		ConsumedAt:        consumedAt,
+	}, nil
+}
+
 func (r *SQLiteRepository) CreateRedirectLink(ctx context.Context, res *domain.Resource, link *domain.ResourceLink, redir *domain.RedirectResource) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
