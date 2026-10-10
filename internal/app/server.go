@@ -51,11 +51,12 @@ func RunServer(cfg Config) error {
 
 	linkService := services.NewLinkService(repo, memCache, analyticsWorker, cfg.DefaultBaseURL)
 	pasteService := services.NewPasteService(repo, cfg.DefaultBaseURL)
+	secretService := services.NewSecretService(repo, cfg.DefaultBaseURL)
 	authService := services.NewAuthService(repo)
 	auditService := services.NewAuditService(repo)
 
 	authMw := middleware.NewAuthMiddleware(authService)
-	apiHandler := handlers.NewAPIHandler(linkService, pasteService, authService, auditService)
+	apiHandler := handlers.NewAPIHandler(linkService, pasteService, secretService, authService, auditService)
 
 	r := chi.NewRouter()
 	r.Use(chiMiddleware.RequestID)
@@ -73,6 +74,10 @@ func RunServer(cfg Config) error {
 
 		// Paste creation
 		r.With(authMw.OptionalAuth).Post("/pastes", apiHandler.CreatePaste)
+
+		// Zero-knowledge secret creation & payload burn
+		r.With(authMw.OptionalAuth).Post("/secrets", apiHandler.CreateSecret)
+		r.With(authMw.OptionalAuth).Get("/secrets/{slug}", apiHandler.GetSecretPayload)
 
 		// API Keys management
 		r.Post("/api-keys", apiHandler.CreateAPIKey)
