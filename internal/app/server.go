@@ -11,9 +11,10 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/relay/relay/internal/core/services"
 	"github.com/relay/relay/internal/http/handlers"
+	"github.com/relay/relay/internal/http/middleware"
 	"github.com/relay/relay/internal/platform/analytics"
 	"github.com/relay/relay/internal/platform/cache"
 	"github.com/relay/relay/internal/platform/db"
@@ -49,12 +50,17 @@ func RunServer(cfg Config) error {
 	defer analyticsWorker.Close()
 
 	linkService := services.NewLinkService(repo, memCache, analyticsWorker, cfg.DefaultBaseURL)
-	apiHandler := handlers.NewAPIHandler(linkService)
+	pasteService := services.NewPasteService(repo, cfg.DefaultBaseURL)
+	authService := services.NewAuthService(repo)
+	auditService := services.NewAuditService(repo)
+
+	authMw := middleware.NewAuthMiddleware(authService)
+	apiHandler := handlers.NewAPIHandler(linkService, pasteService, authService, auditService)
 
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)
+	r.Use(chiMiddleware.RequestID)
+	r.Use(chiMiddleware.RealIP)
+	r.Use(chiMiddleware.Recoverer)
 
 	// Health probes
 	r.Get("/health/live", apiHandler.HealthLive)
@@ -62,8 +68,22 @@ func RunServer(cfg Config) error {
 
 	// API routes
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Post("/links", apiHandler.CreateLink)
+		// Public or API-key authenticated link creation
+		r.With(authMw.OptionalAuth).Post("/links", apiHandler.CreateLink)
+
+		// Paste creation
+		r.With(authMw.OptionalAuth).Post("/pastes", apiHandler.CreatePaste)
+
+		// API Keys management
+		r.Post("/api-keys", apiHandler.CreateAPIKey)
+
+		// Audit logs
+		r.With(authMw.RequireScope("audit:read")).Get("/audit", apiHandler.ListAuditLogs)
 	})
+
+	// Paste viewer & raw export
+	r.Get("/p/{slug}", apiHandler.GetPasteHandler)
+	r.Get("/p/{slug}/raw", apiHandler.GetPasteHandler)
 
 	// Redirect slug fast path (root level /{slug})
 	r.Get("/{slug}", apiHandler.RedirectHandler)

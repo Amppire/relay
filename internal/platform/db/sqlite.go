@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -372,13 +374,330 @@ func (r *SQLiteRepository) RecordAnalyticsEvents(ctx context.Context, events []d
 	return tx.Commit()
 }
 
-func stringsContains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && (len(substr) == 0 || (func() bool {
-		for i := 0; i+len(substr) <= len(s); i++ {
-			if s[i:i+len(substr)] == substr {
-				return true
-			}
+func (r *SQLiteRepository) CreatePasteLink(ctx context.Context, res *domain.Resource, link *domain.ResourceLink, paste *domain.PasteResource) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Insert resource
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO resources (
+			id, workspace_id, created_by, type, name, description, status,
+			created_at, updated_at, expires_at, max_accesses, access_count, metadata
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		res.ID.String(), res.WorkspaceID.String(), nil, string(res.Type), res.Name, res.Description,
+		string(res.Status), res.CreatedAt, res.UpdatedAt, res.ExpiresAt, res.MaxAccesses, res.AccessCount, "{}",
+	)
+	if err != nil {
+		return fmt.Errorf("insert paste resource: %w", err)
+	}
+
+	// Insert link
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO resource_links (id, resource_id, domain_id, slug, enabled, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, link.ID.String(), link.ResourceID.String(), link.DomainID.String(), link.Slug, link.Enabled, link.CreatedAt)
+	if err != nil {
+		if stringsContains(err.Error(), "UNIQUE") {
+			return domain.ErrAlreadyExists
 		}
-		return false
-	})()))
+		return fmt.Errorf("insert paste link: %w", err)
+	}
+
+	// Insert paste_resources
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO paste_resources (resource_id, content, format, language, line_numbers, raw_enabled)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, paste.ResourceID.String(), paste.Content, string(paste.Format), paste.Language, paste.LineNumbers, paste.RawEnabled)
+	if err != nil {
+		return fmt.Errorf("insert paste details: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+func (r *SQLiteRepository) ResolvePaste(ctx context.Context, domainID uuid.UUID, slug string) (*ports.ResolvedPaste, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT 
+			r.id, r.workspace_id, r.type, r.name, r.status, r.created_at, r.updated_at, r.expires_at, r.revoked_at, r.max_accesses, r.access_count,
+			l.id, l.resource_id, l.domain_id, l.slug, l.enabled, l.created_at,
+			p.content, p.format, p.language, p.line_numbers, p.raw_enabled
+		FROM resource_links l
+		JOIN resources r ON r.id = l.resource_id
+		JOIN paste_resources p ON p.resource_id = r.id
+		WHERE l.domain_id = ? AND l.slug = ? AND l.enabled = TRUE
+	`, domainID.String(), slug)
+
+	var (
+		rID, rWsID, rType, rStatus string
+		rName                      *string
+		rCreated, rUpdated         time.Time
+		rExpires, rRevoked         *time.Time
+		rMax                       *int64
+		rAccessCount               int64
+
+		lID, lResID, lDomID, lSlug string
+		lEnabled                   bool
+		lCreated                   time.Time
+
+		content, format string
+		lang            *string
+		lineNumbers     bool
+		rawEnabled      bool
+	)
+
+	err := row.Scan(
+		&rID, &rWsID, &rType, &rName, &rStatus, &rCreated, &rUpdated, &rExpires, &rRevoked, &rMax, &rAccessCount,
+		&lID, &lResID, &lDomID, &lSlug, &lEnabled, &lCreated,
+		&content, &format, &lang, &lineNumbers, &rawEnabled,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+
+	parsedRID, _ := uuid.Parse(rID)
+	parsedRWsID, _ := uuid.Parse(rWsID)
+	parsedLID, _ := uuid.Parse(lID)
+	parsedLDomID, _ := uuid.Parse(lDomID)
+
+	var nameStr string
+	if rName != nil {
+		nameStr = *rName
+	}
+	var langStr string
+	if lang != nil {
+		langStr = *lang
+	}
+
+	res := &domain.Resource{
+		ID:          parsedRID,
+		WorkspaceID: parsedRWsID,
+		Type:        domain.ResourceType(rType),
+		Name:        nameStr,
+		Status:      domain.ResourceStatus(rStatus),
+		CreatedAt:   rCreated,
+		UpdatedAt:   rUpdated,
+		ExpiresAt:   rExpires,
+		RevokedAt:   rRevoked,
+		MaxAccesses: rMax,
+		AccessCount: rAccessCount,
+	}
+
+	link := &domain.ResourceLink{
+		ID:         parsedLID,
+		ResourceID: parsedRID,
+		DomainID:   parsedLDomID,
+		Slug:       lSlug,
+		Enabled:    lEnabled,
+		CreatedAt:  lCreated,
+	}
+
+	paste := &domain.PasteResource{
+		ResourceID:  parsedRID,
+		Content:     content,
+		Format:      domain.PasteFormat(format),
+		Language:    langStr,
+		LineNumbers: lineNumbers,
+		RawEnabled:  rawEnabled,
+	}
+
+	return &ports.ResolvedPaste{
+		Resource: res,
+		Link:     link,
+		Paste:    paste,
+	}, nil
+}
+
+func (r *SQLiteRepository) CreateAPIKey(ctx context.Context, key *domain.APIKey) error {
+	scopesStr := strings.Join(key.Scopes, ",")
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO api_keys (id, workspace_id, name, key_prefix, key_hash, scopes, expires_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, key.ID.String(), key.WorkspaceID.String(), key.Name, key.KeyPrefix, key.KeyHash, scopesStr, key.ExpiresAt, key.CreatedAt)
+	return err
+}
+
+func (r *SQLiteRepository) GetAPIKeyByHash(ctx context.Context, keyHash string) (*domain.APIKey, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT id, workspace_id, name, key_prefix, key_hash, scopes, expires_at, last_used_at, created_at, revoked_at
+		FROM api_keys
+		WHERE key_hash = ?
+	`, keyHash)
+
+	var (
+		id, wsID, name, prefix, hash, scopes string
+		expires, lastUsed, revoked           *time.Time
+		created                              time.Time
+	)
+
+	if err := row.Scan(&id, &wsID, &name, &prefix, &hash, &scopes, &expires, &lastUsed, &created, &revoked); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrInvalidAPIKey
+		}
+		return nil, err
+	}
+
+	parsedID, _ := uuid.Parse(id)
+	parsedWsID, _ := uuid.Parse(wsID)
+
+	var scopeList []string
+	if scopes != "" {
+		scopeList = strings.Split(scopes, ",")
+	}
+
+	return &domain.APIKey{
+		ID:          parsedID,
+		WorkspaceID: parsedWsID,
+		Name:        name,
+		KeyPrefix:   prefix,
+		KeyHash:     hash,
+		Scopes:      scopeList,
+		ExpiresAt:   expires,
+		LastUsedAt:  lastUsed,
+		CreatedAt:   created,
+		RevokedAt:   revoked,
+	}, nil
+}
+
+func (r *SQLiteRepository) ListAPIKeys(ctx context.Context, workspaceID uuid.UUID) ([]domain.APIKey, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, workspace_id, name, key_prefix, scopes, expires_at, last_used_at, created_at, revoked_at
+		FROM api_keys
+		WHERE workspace_id = ?
+		ORDER BY created_at DESC
+	`, workspaceID.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []domain.APIKey
+	for rows.Next() {
+		var id, wsID, name, prefix, scopes string
+		var expires, lastUsed, revoked *time.Time
+		var created time.Time
+
+		if err := rows.Scan(&id, &wsID, &name, &prefix, &scopes, &expires, &lastUsed, &created, &revoked); err != nil {
+			return nil, err
+		}
+
+		pid, _ := uuid.Parse(id)
+		pwid, _ := uuid.Parse(wsID)
+
+		keys = append(keys, domain.APIKey{
+			ID:          pid,
+			WorkspaceID: pwid,
+			Name:        name,
+			KeyPrefix:   prefix,
+			Scopes:      strings.Split(scopes, ","),
+			ExpiresAt:   expires,
+			LastUsedAt:  lastUsed,
+			CreatedAt:   created,
+			RevokedAt:   revoked,
+		})
+	}
+	return keys, nil
+}
+
+func (r *SQLiteRepository) RevokeAPIKey(ctx context.Context, workspaceID, id uuid.UUID) error {
+	now := time.Now().UTC()
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE api_keys SET revoked_at = ?
+		WHERE workspace_id = ? AND id = ? AND revoked_at IS NULL
+	`, now, workspaceID.String(), id.String())
+	return err
+}
+
+func (r *SQLiteRepository) RecordAuditEvent(ctx context.Context, event *domain.AuditEvent) error {
+	metaJSON, _ := json.Marshal(event.Metadata)
+	var actorIDStr *string
+	if event.ActorID != nil {
+		s := event.ActorID.String()
+		actorIDStr = &s
+	}
+	var resIDStr *string
+	if event.ResourceID != nil {
+		s := event.ResourceID.String()
+		resIDStr = &s
+	}
+
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO audit_events (id, workspace_id, actor_id, actor_type, action, resource_id, ip, user_agent, metadata, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, event.ID.String(), event.WorkspaceID.String(), actorIDStr, event.ActorType, event.Action, resIDStr, event.IP, event.UserAgent, string(metaJSON), event.CreatedAt)
+	return err
+}
+
+func (r *SQLiteRepository) ListAuditEvents(ctx context.Context, workspaceID uuid.UUID, limit int) ([]domain.AuditEvent, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, workspace_id, actor_id, actor_type, action, resource_id, ip, user_agent, metadata, created_at
+		FROM audit_events
+		WHERE workspace_id = ?
+		ORDER BY created_at DESC
+		LIMIT ?
+	`, workspaceID.String(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []domain.AuditEvent
+	for rows.Next() {
+		var id, wsID, actorType, action, metaStr string
+		var actorID, resID, ip, ua *string
+		var created time.Time
+
+		if err := rows.Scan(&id, &wsID, &actorID, &actorType, &action, &resID, &ip, &ua, &metaStr, &created); err != nil {
+			return nil, err
+		}
+
+		pid, _ := uuid.Parse(id)
+		pwid, _ := uuid.Parse(wsID)
+
+		var parsedActorID *uuid.UUID
+		if actorID != nil {
+			u, _ := uuid.Parse(*actorID)
+			parsedActorID = &u
+		}
+		var parsedResID *uuid.UUID
+		if resID != nil {
+			u, _ := uuid.Parse(*resID)
+			parsedResID = &u
+		}
+
+		var metaMap map[string]any
+		_ = json.Unmarshal([]byte(metaStr), &metaMap)
+
+		var ipStr, uaStr string
+		if ip != nil {
+			ipStr = *ip
+		}
+		if ua != nil {
+			uaStr = *ua
+		}
+
+		events = append(events, domain.AuditEvent{
+			ID:          pid,
+			WorkspaceID: pwid,
+			ActorID:     parsedActorID,
+			ActorType:   actorType,
+			Action:      action,
+			ResourceID:  parsedResID,
+			IP:          ipStr,
+			UserAgent:   uaStr,
+			Metadata:    metaMap,
+			CreatedAt:   created,
+		})
+	}
+	return events, nil
+}
+
+func stringsContains(s, substr string) bool {
+	return strings.Contains(s, substr)
 }

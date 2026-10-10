@@ -21,6 +21,7 @@ type ResourceType string
 
 const (
 	ResourceTypeRedirect ResourceType = "redirect"
+	ResourceTypePaste    ResourceType = "paste"
 	ResourceTypeSecret   ResourceType = "secret"
 	ResourceTypeFile     ResourceType = "file"
 	ResourceTypePayload  ResourceType = "payload"
