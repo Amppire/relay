@@ -42,6 +42,7 @@ type Resource struct {
 	ID          uuid.UUID       `json:"id"`
 	WorkspaceID uuid.UUID       `json:"workspace_id"`
 	CreatedBy   *uuid.UUID      `json:"created_by,omitempty"`
+	PolicyID    *uuid.UUID      `json:"policy_id,omitempty"`
 	Type        ResourceType    `json:"type"`
 	Name        string          `json:"name,omitempty"`
 	Description string          `json:"description,omitempty"`
