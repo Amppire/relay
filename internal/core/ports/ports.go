@@ -41,10 +41,15 @@ type Repository interface {
 	ResolvePaste(ctx context.Context, domainID uuid.UUID, slug string) (*ResolvedPaste, error)
 	ResolveSecret(ctx context.Context, domainID uuid.UUID, slug string) (*ResolvedSecret, error)
 	ConsumeSecret(ctx context.Context, resourceID uuid.UUID) (*domain.SecretResource, error)
-	GetLinkByID(ctx context.Context, id uuid.UUID) (*domain.ResourceLink, error)
 	GetResourceByID(ctx context.Context, id uuid.UUID) (*domain.Resource, error)
 	IncrementAccessCount(ctx context.Context, resourceID uuid.UUID) error
 	DeleteLink(ctx context.Context, id uuid.UUID) error
+
+	// Policies
+	CreatePolicy(ctx context.Context, policy *domain.Policy) error
+	GetPolicyByID(ctx context.Context, id uuid.UUID) (*domain.Policy, error)
+	ListPolicies(ctx context.Context, workspaceID uuid.UUID) ([]domain.Policy, error)
+	DeletePolicy(ctx context.Context, id uuid.UUID) error
 
 	// API Keys
 	CreateAPIKey(ctx context.Context, key *domain.APIKey) error
