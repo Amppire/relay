@@ -19,15 +19,24 @@ type APIHandler struct {
 	linkService   *services.LinkService
 	pasteService  *services.PasteService
 	secretService *services.SecretService
+	policyService *services.PolicyService
 	authService   *services.AuthService
 	auditService  *services.AuditService
 }
 
-func NewAPIHandler(linkService *services.LinkService, pasteService *services.PasteService, secretService *services.SecretService, authService *services.AuthService, auditService *services.AuditService) *APIHandler {
+func NewAPIHandler(
+	linkService *services.LinkService,
+	pasteService *services.PasteService,
+	secretService *services.SecretService,
+	policyService *services.PolicyService,
+	authService *services.AuthService,
+	auditService *services.AuditService,
+) *APIHandler {
 	return &APIHandler{
 		linkService:   linkService,
 		pasteService:  pasteService,
 		secretService: secretService,
+		policyService: policyService,
 		authService:   authService,
 		auditService:  auditService,
 	}
@@ -277,6 +286,44 @@ func (h *APIHandler) CreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// POST /api/v1/policies
+func (h *APIHandler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
+	var req services.CreatePolicyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+
+	var actorID *uuid.UUID
+	if apiKey := middleware.GetAPIKeyFromContext(r.Context()); apiKey != nil {
+		actorID = &apiKey.ID
+	}
+
+	policy, err := h.policyService.CreatePolicy(r.Context(), req, actorID)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(policy)
+}
+
+// GET /api/v1/policies
+func (h *APIHandler) ListPolicies(w http.ResponseWriter, r *http.Request) {
+	policies, err := h.policyService.ListPolicies(r.Context(), uuid.Nil)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"policies": policies})
+}
+
 // GET /api/v1/audit
 func (h *APIHandler) ListAuditLogs(w http.ResponseWriter, r *http.Request) {
 	events, err := h.auditService.ListEvents(r.Context(), uuid.Nil, 50)
@@ -307,6 +354,9 @@ func (h *APIHandler) RedirectHandler(w http.ResponseWriter, r *http.Request) {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
 		clientIP = strings.Split(fwd, ",")[0]
 	}
+	if strings.Contains(clientIP, ":") {
+		clientIP = strings.Split(clientIP, ":")[0]
+	}
 
 	userAgent := r.UserAgent()
 	referer := r.Referer()
@@ -314,6 +364,11 @@ func (h *APIHandler) RedirectHandler(w http.ResponseWriter, r *http.Request) {
 
 	dest, code, err := h.linkService.ResolveAndTrack(r.Context(), hostname, slug, clientIP, userAgent, referer, queryString)
 	if err != nil {
+		if errors.Is(err, domain.ErrPolicyDenied) {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"access forbidden by policy"}`))
+			return
+		}
 		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrExpired) || errors.Is(err, domain.ErrMaxAccessCount) || errors.Is(err, domain.ErrRevoked) {
 			http.NotFound(w, r)
 			return
