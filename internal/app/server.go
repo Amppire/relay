@@ -49,14 +49,15 @@ func RunServer(cfg Config) error {
 	analyticsWorker := analytics.NewAsyncBuffer(repo, 5000, 50, 1*time.Second, logger)
 	defer analyticsWorker.Close()
 
-	linkService := services.NewLinkService(repo, memCache, analyticsWorker, cfg.DefaultBaseURL)
+	policyService := services.NewPolicyService(repo, nil)
+	linkService := services.NewLinkService(repo, policyService, memCache, analyticsWorker, cfg.DefaultBaseURL)
 	pasteService := services.NewPasteService(repo, cfg.DefaultBaseURL)
 	secretService := services.NewSecretService(repo, cfg.DefaultBaseURL)
 	authService := services.NewAuthService(repo)
 	auditService := services.NewAuditService(repo)
 
 	authMw := middleware.NewAuthMiddleware(authService)
-	apiHandler := handlers.NewAPIHandler(linkService, pasteService, secretService, authService, auditService)
+	apiHandler := handlers.NewAPIHandler(linkService, pasteService, secretService, policyService, authService, auditService)
 
 	r := chi.NewRouter()
 	r.Use(chiMiddleware.RequestID)
@@ -78,6 +79,10 @@ func RunServer(cfg Config) error {
 		// Zero-knowledge secret creation & payload burn
 		r.With(authMw.OptionalAuth).Post("/secrets", apiHandler.CreateSecret)
 		r.With(authMw.OptionalAuth).Get("/secrets/{slug}", apiHandler.GetSecretPayload)
+
+		// Access Policies
+		r.With(authMw.RequireScope("policy:write")).Post("/policies", apiHandler.CreatePolicy)
+		r.With(authMw.RequireScope("policy:read")).Get("/policies", apiHandler.ListPolicies)
 
 		// API Keys management
 		r.Post("/api-keys", apiHandler.CreateAPIKey)
