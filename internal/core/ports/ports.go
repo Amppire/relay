@@ -45,6 +45,19 @@ type Repository interface {
 	IncrementAccessCount(ctx context.Context, resourceID uuid.UUID) error
 	DeleteLink(ctx context.Context, id uuid.UUID) error
 
+	// Files
+	CreateFileLink(ctx context.Context, res *domain.Resource, link *domain.ResourceLink, file *domain.FileResource) error
+	ResolveFile(ctx context.Context, domainID uuid.UUID, slug string) (*domain.Resource, *domain.ResourceLink, *domain.FileResource, error)
+
+	// Requests
+	CreateRequestPortal(ctx context.Context, res *domain.Resource, link *domain.ResourceLink, req *domain.RequestResource) error
+	ResolveRequest(ctx context.Context, domainID uuid.UUID, slug string) (*domain.Resource, *domain.ResourceLink, *domain.RequestResource, error)
+	FulfillRequest(ctx context.Context, resourceID uuid.UUID, payload, encKey, nonce []byte) error
+
+	// Webhooks
+	CreateWebhook(ctx context.Context, webhook *domain.Webhook) error
+	ListWebhooks(ctx context.Context, workspaceID uuid.UUID) ([]domain.Webhook, error)
+
 	// Policies
 	CreatePolicy(ctx context.Context, policy *domain.Policy) error
 	GetPolicyByID(ctx context.Context, id uuid.UUID) (*domain.Policy, error)
