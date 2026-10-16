@@ -35,6 +35,10 @@ func main() {
 		runPasteCmd(os.Args[2:])
 	case "secret":
 		runSecretCmd(os.Args[2:])
+	case "file":
+		runFileCmd(os.Args[2:])
+	case "request":
+		runRequestCmd(os.Args[2:])
 	case "keys":
 		runKeysCmd(os.Args[2:])
 	case "config":
@@ -58,7 +62,11 @@ Commands:
   server       Start the Relay HTTP server
   shorten      Create a new shortened link
   paste        Share text, markdown, or code with an expiring link
+  secret       Create or read zero-knowledge encrypted secrets
+  file         Encrypt and upload files securely
+  request      Create asymmetric collection portals ("Send creds to me")
   keys         Manage API keys
+  config       Manage client profiles and remote API endpoints
 
 Run 'relayctl <command> --help' for details on specific commands.`)
 }
