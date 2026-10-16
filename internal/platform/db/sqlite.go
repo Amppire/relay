@@ -161,6 +161,308 @@ func (r *SQLiteRepository) ListPolicies(ctx context.Context, workspaceID uuid.UU
 	return list, nil
 }
 
+func (r *SQLiteRepository) CreateFileLink(ctx context.Context, res *domain.Resource, link *domain.ResourceLink, file *domain.FileResource) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var policyIDStr *string
+	if res.PolicyID != nil {
+		s := res.PolicyID.String()
+		policyIDStr = &s
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO resources (
+			id, workspace_id, created_by, policy_id, type, name, description, status,
+			created_at, updated_at, expires_at, max_accesses, access_count, metadata
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, res.ID.String(), res.WorkspaceID.String(), nil, policyIDStr, string(res.Type), res.Name, res.Description,
+		string(res.Status), res.CreatedAt, res.UpdatedAt, res.ExpiresAt, res.MaxAccesses, res.AccessCount, "{}")
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO resource_links (id, resource_id, domain_id, slug, enabled, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, link.ID.String(), link.ResourceID.String(), link.DomainID.String(), link.Slug, link.Enabled, link.CreatedAt)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO file_resources (resource_id, storage_key, filename, size_bytes, content_type, cipher, cipher_version, nonce, sha256_hash)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, file.ResourceID.String(), file.StorageKey, file.Filename, file.SizeBytes, file.ContentType, file.Cipher, file.CipherVersion, file.Nonce, file.SHA256Hash)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (r *SQLiteRepository) ResolveFile(ctx context.Context, domainID uuid.UUID, slug string) (*domain.Resource, *domain.ResourceLink, *domain.FileResource, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT 
+			r.id, r.workspace_id, r.policy_id, r.type, r.name, r.status, r.created_at, r.updated_at, r.expires_at, r.max_accesses, r.access_count,
+			l.id, l.resource_id, l.domain_id, l.slug, l.enabled, l.created_at,
+			f.storage_key, f.filename, f.size_bytes, f.content_type, f.cipher, f.cipher_version, f.nonce, f.sha256_hash
+		FROM resource_links l
+		JOIN resources r ON r.id = l.resource_id
+		JOIN file_resources f ON f.resource_id = r.id
+		WHERE l.domain_id = ? AND l.slug = ? AND l.enabled = TRUE
+	`, domainID.String(), slug)
+
+	var (
+		rID, wsID, rType, rName, rStatus string
+		policyIDStr                      *string
+		rCreated, rUpdated               time.Time
+		rExpires                         *time.Time
+		rMax                             *int64
+		rAccessCount                     int64
+
+		lID, lResID, lDomID, lSlug string
+		lEnabled                   bool
+		lCreated                   time.Time
+
+		storageKey, filename, contentType, cipher, sha256 string
+		sizeBytes                                         int64
+		cipherVer                                         int
+		nonce                                             []byte
+	)
+
+	err := row.Scan(
+		&rID, &wsID, &policyIDStr, &rType, &rName, &rStatus, &rCreated, &rUpdated, &rExpires, &rMax, &rAccessCount,
+		&lID, &lResID, &lDomID, &lSlug, &lEnabled, &lCreated,
+		&storageKey, &filename, &sizeBytes, &contentType, &cipher, &cipherVer, &nonce, &sha256,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, nil, domain.ErrNotFound
+		}
+		return nil, nil, nil, err
+	}
+
+	prid, _ := uuid.Parse(rID)
+	pwid, _ := uuid.Parse(wsID)
+	plid, _ := uuid.Parse(lID)
+	pldomid, _ := uuid.Parse(lDomID)
+
+	var polID *uuid.UUID
+	if policyIDStr != nil {
+		u, _ := uuid.Parse(*policyIDStr)
+		polID = &u
+	}
+
+	res := &domain.Resource{
+		ID:          prid,
+		WorkspaceID: pwid,
+		PolicyID:    polID,
+		Type:        domain.ResourceType(rType),
+		Name:        rName,
+		Status:      domain.ResourceStatus(rStatus),
+		CreatedAt:   rCreated,
+		UpdatedAt:   rUpdated,
+		ExpiresAt:   rExpires,
+		MaxAccesses: rMax,
+		AccessCount: rAccessCount,
+	}
+
+	link := &domain.ResourceLink{
+		ID:         plid,
+		ResourceID: prid,
+		DomainID:   pldomid,
+		Slug:       lSlug,
+		Enabled:    lEnabled,
+		CreatedAt:  lCreated,
+	}
+
+	fileMeta := &domain.FileResource{
+		ResourceID:    prid,
+		StorageKey:    storageKey,
+		Filename:      filename,
+		SizeBytes:     sizeBytes,
+		ContentType:   contentType,
+		Cipher:        cipher,
+		CipherVersion: cipherVer,
+		Nonce:         nonce,
+		SHA256Hash:    sha256,
+	}
+
+	return res, link, fileMeta, nil
+}
+
+func (r *SQLiteRepository) CreateRequestPortal(ctx context.Context, res *domain.Resource, link *domain.ResourceLink, req *domain.RequestResource) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO resources (
+			id, workspace_id, created_by, type, name, description, status,
+			created_at, updated_at, expires_at, max_accesses, access_count, metadata
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, res.ID.String(), res.WorkspaceID.String(), nil, string(res.Type), res.Name, "",
+		string(res.Status), res.CreatedAt, res.UpdatedAt, res.ExpiresAt, nil, 0, "{}")
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO resource_links (id, resource_id, domain_id, slug, enabled, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, link.ID.String(), link.ResourceID.String(), link.DomainID.String(), link.Slug, link.Enabled, link.CreatedAt)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO request_resources (resource_id, public_key)
+		VALUES (?, ?)
+	`, req.ResourceID.String(), req.PublicKey)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func (r *SQLiteRepository) ResolveRequest(ctx context.Context, domainID uuid.UUID, slug string) (*domain.Resource, *domain.ResourceLink, *domain.RequestResource, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT 
+			r.id, r.workspace_id, r.type, r.name, r.status, r.created_at, r.updated_at, r.expires_at,
+			l.id, l.resource_id, l.domain_id, l.slug, l.enabled, l.created_at,
+			rq.public_key, rq.submitted_at, rq.encrypted_payload, rq.encrypted_key, rq.nonce
+		FROM resource_links l
+		JOIN resources r ON r.id = l.resource_id
+		JOIN request_resources rq ON rq.resource_id = r.id
+		WHERE l.domain_id = ? AND l.slug = ? AND l.enabled = TRUE
+	`, domainID.String(), slug)
+
+	var (
+		rID, wsID, rType, rName, rStatus string
+		rCreated, rUpdated               time.Time
+		rExpires                         *time.Time
+
+		lID, lResID, lDomID, lSlug string
+		lEnabled                   bool
+		lCreated                   time.Time
+
+		pubKey                     string
+		submittedAt                *time.Time
+		encPayload, encKey, nonce []byte
+	)
+
+	err := row.Scan(
+		&rID, &wsID, &rType, &rName, &rStatus, &rCreated, &rUpdated, &rExpires,
+		&lID, &lResID, &lDomID, &lSlug, &lEnabled, &lCreated,
+		&pubKey, &submittedAt, &encPayload, &encKey, &nonce,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, nil, domain.ErrNotFound
+		}
+		return nil, nil, nil, err
+	}
+
+	prid, _ := uuid.Parse(rID)
+	pwid, _ := uuid.Parse(wsID)
+	plid, _ := uuid.Parse(lID)
+	pldomid, _ := uuid.Parse(lDomID)
+
+	res := &domain.Resource{
+		ID:          prid,
+		WorkspaceID: pwid,
+		Type:        domain.ResourceType(rType),
+		Name:        rName,
+		Status:      domain.ResourceStatus(rStatus),
+		CreatedAt:   rCreated,
+		UpdatedAt:   rUpdated,
+		ExpiresAt:   rExpires,
+	}
+
+	link := &domain.ResourceLink{
+		ID:         plid,
+		ResourceID: prid,
+		DomainID:   pldomid,
+		Slug:       lSlug,
+		Enabled:    lEnabled,
+		CreatedAt:  lCreated,
+	}
+
+	req := &domain.RequestResource{
+		ResourceID:       prid,
+		PublicKey:        pubKey,
+		SubmittedAt:      submittedAt,
+		EncryptedPayload: encPayload,
+		EncryptedKey:     encKey,
+		Nonce:            nonce,
+	}
+
+	return res, link, req, nil
+}
+
+func (r *SQLiteRepository) FulfillRequest(ctx context.Context, resourceID uuid.UUID, payload, encKey, nonce []byte) error {
+	now := time.Now().UTC()
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE request_resources
+		SET submitted_at = ?, encrypted_payload = ?, encrypted_key = ?, nonce = ?
+		WHERE resource_id = ? AND submitted_at IS NULL
+	`, now, payload, encKey, nonce, resourceID.String())
+	return err
+}
+
+func (r *SQLiteRepository) CreateWebhook(ctx context.Context, wh *domain.Webhook) error {
+	eventsStr := strings.Join(wh.Events, ",")
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO webhooks (id, workspace_id, url, secret, events, active, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, wh.ID.String(), wh.WorkspaceID.String(), wh.URL, wh.Secret, eventsStr, wh.Active, wh.CreatedAt)
+	return err
+}
+
+func (r *SQLiteRepository) ListWebhooks(ctx context.Context, workspaceID uuid.UUID) ([]domain.Webhook, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, workspace_id, url, secret, events, active, created_at
+		FROM webhooks
+		WHERE workspace_id = ? AND active = TRUE
+	`, workspaceID.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var hooks []domain.Webhook
+	for rows.Next() {
+		var id, wsID, url, secret, events string
+		var active bool
+		var created time.Time
+
+		if err := rows.Scan(&id, &wsID, &url, &secret, &events, &active, &created); err != nil {
+			return nil, err
+		}
+
+		pid, _ := uuid.Parse(id)
+		pwid, _ := uuid.Parse(wsID)
+
+		hooks = append(hooks, domain.Webhook{
+			ID:          pid,
+			WorkspaceID: pwid,
+			URL:         url,
+			Secret:      secret,
+			Events:      strings.Split(events, ","),
+			Active:      active,
+			CreatedAt:   created,
+		})
+	}
+	return hooks, nil
+}
+
 func (r *SQLiteRepository) DeletePolicy(ctx context.Context, id uuid.UUID) error {
 	_, err := r.db.ExecContext(ctx, "DELETE FROM policies WHERE id = ?", id.String())
 	return err
