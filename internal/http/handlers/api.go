@@ -16,18 +16,20 @@ import (
 )
 
 type APIHandler struct {
-	linkService  *services.LinkService
-	pasteService *services.PasteService
-	authService  *services.AuthService
-	auditService *services.AuditService
+	linkService   *services.LinkService
+	pasteService  *services.PasteService
+	secretService *services.SecretService
+	authService   *services.AuthService
+	auditService  *services.AuditService
 }
 
-func NewAPIHandler(linkService *services.LinkService, pasteService *services.PasteService, authService *services.AuthService, auditService *services.AuditService) *APIHandler {
+func NewAPIHandler(linkService *services.LinkService, pasteService *services.PasteService, secretService *services.SecretService, authService *services.AuthService, auditService *services.AuditService) *APIHandler {
 	return &APIHandler{
-		linkService:  linkService,
-		pasteService: pasteService,
-		authService:  authService,
-		auditService: auditService,
+		linkService:   linkService,
+		pasteService:  pasteService,
+		secretService: secretService,
+		authService:   authService,
+		auditService:  auditService,
 	}
 }
 
@@ -92,6 +94,84 @@ func (h *APIHandler) CreatePaste(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// POST /api/v1/secrets
+func (h *APIHandler) CreateSecret(w http.ResponseWriter, r *http.Request) {
+	var req services.CreateSecretRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+
+	var actorID *uuid.UUID
+	actorType := "anonymous"
+
+	if apiKey := middleware.GetAPIKeyFromContext(r.Context()); apiKey != nil {
+		actorID = &apiKey.ID
+		actorType = "api_key"
+	}
+
+	resp, err := h.secretService.CreateSecret(r.Context(), req, actorID, actorType)
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalidSecretPayload) {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, domain.ErrAlreadyExists) {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "slug already in use"})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// GET /api/v1/secrets/{slug} (retrieves and consumes single-use secrets)
+func (h *APIHandler) GetSecretPayload(w http.ResponseWriter, r *http.Request) {
+	slug := chi.URLParam(r, "slug")
+	if slug == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	hostname := r.Host
+	if strings.Contains(hostname, ":") {
+		hostname = strings.Split(hostname, ":")[0]
+	}
+
+	var actorID *uuid.UUID
+	actorType := "anonymous"
+	if apiKey := middleware.GetAPIKeyFromContext(r.Context()); apiKey != nil {
+		actorID = &apiKey.ID
+		actorType = "api_key"
+	}
+
+	payload, err := h.secretService.FetchAndBurn(r.Context(), hostname, slug, actorID, actorType)
+	if err != nil {
+		if errors.Is(err, domain.ErrSecretAlreadyConsumed) {
+			w.WriteHeader(http.StatusGone) // 410 Gone: burned
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "secret has already been consumed or destroyed"})
+			return
+		}
+		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrExpired) || errors.Is(err, domain.ErrMaxAccessCount) || errors.Is(err, domain.ErrRevoked) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 // GET /p/{slug} and GET /p/{slug}/raw

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"github.com/relay/relay/internal/app"
 	"github.com/relay/relay/internal/core/domain"
 	"github.com/relay/relay/internal/core/services"
+	"github.com/relay/relay/internal/platform/crypto"
 )
 
 func main() {
@@ -31,6 +33,8 @@ func main() {
 		runShortenCmd(os.Args[2:])
 	case "paste":
 		runPasteCmd(os.Args[2:])
+	case "secret":
+		runSecretCmd(os.Args[2:])
 	case "keys":
 		runKeysCmd(os.Args[2:])
 	case "help", "-h", "--help":
@@ -252,6 +256,216 @@ func runPasteCmd(args []string) {
 	}
 
 	fmt.Printf("Link: %s\nRaw:  %s\n", created.URL, created.RawURL)
+}
+
+func runSecretCmd(args []string) {
+	if len(args) < 1 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+		fmt.Println(`Usage:
+  relayctl secret create [text] [--password=pass] [--once] [--expire=1h]
+  relayctl secret read <url_with_fragment> [--password=pass]`)
+		return
+	}
+
+	sub := args[0]
+	switch sub {
+	case "create":
+		fs := flag.NewFlagSet("secret create", flag.ExitOnError)
+		title := fs.String("title", "", "Optional title")
+		password := fs.String("password", "", "Optional password protection (Argon2id KEK)")
+		once := fs.Bool("once", true, "Destroy secret immediately after reading")
+		slug := fs.String("slug", "", "Custom slug")
+		endpoint := fs.String("endpoint", "http://localhost:8080", "Relay server address")
+		token := fs.String("token", "", "API key (optional)")
+		expire := fs.String("expire", "", "Expiration duration (e.g. 1h, 24h, 7d)")
+		_ = fs.Parse(args[1:])
+
+		var plaintext string
+		if fs.NArg() > 0 {
+			plaintext = fs.Arg(0)
+		} else {
+			stat, _ := os.Stdin.Stat()
+			if (stat.Mode() & os.ModeCharDevice) != 0 {
+				fmt.Fprintln(os.Stderr, "Error: missing secret payload or piped stdin.")
+				fmt.Fprintln(os.Stderr, "Usage: echo 'secret' | relayctl secret create --once")
+				os.Exit(1)
+			}
+			data, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed reading stdin: %v\n", err)
+				os.Exit(1)
+			}
+			plaintext = string(data)
+		}
+
+		if strings.TrimSpace(plaintext) == "" {
+			fmt.Fprintln(os.Stderr, "Error: secret cannot be empty.")
+			os.Exit(1)
+		}
+
+		// Client-side AES-256-GCM encryption
+		aad := crypto.BuildAAD("", "secret", crypto.CurrentCipherVersion)
+		ciphertext, nonce, dek, err := crypto.EncryptPayload([]byte(plaintext), aad)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Encryption error: %v\n", err)
+			os.Exit(1)
+		}
+
+		var wrappedDEKB64, saltB64, kdfParamsStr string
+		var keyFragment string
+
+		if *password != "" {
+			wrapped, salt, wrapNonce, paramsJSON, err := crypto.WrapKey(dek, *password)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Key wrapping error: %v\n", err)
+				os.Exit(1)
+			}
+			wrappedDEKB64 = base64.StdEncoding.EncodeToString(append(wrapNonce, wrapped...))
+			saltB64 = base64.StdEncoding.EncodeToString(salt)
+			kdfParamsStr = paramsJSON
+			keyFragment = "pwd" // Indicates password protection
+		} else {
+			keyFragment = crypto.EncodeKeyFragment(dek)
+		}
+
+		var expiresAt *time.Time
+		if *expire != "" {
+			d, err := parseDuration(*expire)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Invalid --expire: %v\n", err)
+				os.Exit(1)
+			}
+			t := time.Now().UTC().Add(d)
+			expiresAt = &t
+		}
+
+		reqPayload := services.CreateSecretRequest{
+			Ciphertext:       base64.StdEncoding.EncodeToString(ciphertext),
+			Nonce:            base64.StdEncoding.EncodeToString(nonce),
+			Cipher:           crypto.CipherSuiteAESGCM,
+			CipherVersion:    crypto.CurrentCipherVersion,
+			WrappedDEK:       wrappedDEKB64,
+			Salt:             saltB64,
+			KDFParams:        kdfParamsStr,
+			DestroyAfterRead: *once,
+			Title:            *title,
+			Slug:             *slug,
+			ExpiresAt:        expiresAt,
+		}
+
+		data, _ := json.Marshal(reqPayload)
+		url := strings.TrimRight(*endpoint, "/") + "/api/v1/secrets"
+		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+		req.Header.Set("Content-Type", "application/json")
+		if *token != "" {
+			req.Header.Set("Authorization", "Bearer "+*token)
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to connect to Relay server: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusCreated {
+			fmt.Fprintf(os.Stderr, "Server returned error (HTTP %d): %s\n", resp.StatusCode, string(body))
+			os.Exit(1)
+		}
+
+		var created services.CreateSecretResponse
+		_ = json.Unmarshal(body, &created)
+
+		fullShareURL := fmt.Sprintf("%s#%s", created.URL, keyFragment)
+		fmt.Printf("Secret created!\nURL: %s\n", fullShareURL)
+
+	case "read":
+		fs := flag.NewFlagSet("secret read", flag.ExitOnError)
+		password := fs.String("password", "", "Password for password-protected secrets")
+		_ = fs.Parse(args[1:])
+
+		if fs.NArg() < 1 {
+			fmt.Fprintln(os.Stderr, "Usage: relayctl secret read <url_with_fragment>")
+			os.Exit(1)
+		}
+
+		rawURL := fs.Arg(0)
+		parts := strings.SplitN(rawURL, "#", 2)
+		urlWithoutFragment := parts[0]
+		var fragment string
+		if len(parts) == 2 {
+			fragment = parts[1]
+		}
+
+		urlPieces := strings.Split(strings.TrimRight(urlWithoutFragment, "/"), "/")
+		slug := urlPieces[len(urlPieces)-1]
+		baseURL := strings.Join(urlPieces[:len(urlPieces)-2], "/") // strip /s/{slug}
+
+		apiURL := fmt.Sprintf("%s/api/v1/secrets/%s", baseURL, slug)
+		resp, err := http.Get(apiURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to fetch secret: %v\n", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusGone {
+			fmt.Fprintln(os.Stderr, "Error: secret has already been consumed or burned.")
+			os.Exit(1)
+		}
+		if resp.StatusCode != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "Server error (HTTP %d): %s\n", resp.StatusCode, string(body))
+			os.Exit(1)
+		}
+
+		var payload services.SecretPayloadResponse
+		_ = json.Unmarshal(body, &payload)
+
+		ciphertext, _ := base64.StdEncoding.DecodeString(payload.Ciphertext)
+		nonce, _ := base64.StdEncoding.DecodeString(payload.Nonce)
+
+		var dek []byte
+		if payload.WrappedDEK != "" {
+			if *password == "" {
+				fmt.Fprintln(os.Stderr, "Error: this secret is password protected. Provide --password.")
+				os.Exit(1)
+			}
+			wrappedBytes, _ := base64.StdEncoding.DecodeString(payload.WrappedDEK)
+			saltBytes, _ := base64.StdEncoding.DecodeString(payload.Salt)
+			wrapNonce := wrappedBytes[:crypto.NonceSize]
+			wrapCipher := wrappedBytes[crypto.NonceSize:]
+
+			dek, err = crypto.UnwrapKey(wrapCipher, saltBytes, wrapNonce, *password, payload.KDFParams)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Password verification failed: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			if fragment == "" {
+				fmt.Fprintln(os.Stderr, "Error: missing decryption key fragment in URL.")
+				os.Exit(1)
+			}
+			dek, err = crypto.DecodeKeyFragment(fragment)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Invalid key fragment: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		aad := crypto.BuildAAD("", "secret", payload.CipherVersion)
+		plaintext, err := crypto.DecryptPayload(ciphertext, nonce, dek, aad)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Decryption failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Print(string(plaintext))
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown subcommand: %s\n", sub)
+		os.Exit(1)
+	}
 }
 
 func runKeysCmd(args []string) {

@@ -21,6 +21,13 @@ type ResolvedPaste struct {
 	Paste    *domain.PasteResource
 }
 
+// ResolvedSecret is returned by the secret resolver.
+type ResolvedSecret struct {
+	Resource *domain.Resource
+	Link     *domain.ResourceLink
+	Secret   *domain.SecretResource
+}
+
 type Repository interface {
 	// Workspace & Domain
 	GetOrCreateDefaultWorkspace(ctx context.Context) (*domain.Workspace, *domain.Domain, error)
@@ -29,8 +36,11 @@ type Repository interface {
 	// Resource & Links
 	CreateRedirectLink(ctx context.Context, res *domain.Resource, link *domain.ResourceLink, redir *domain.RedirectResource) error
 	CreatePasteLink(ctx context.Context, res *domain.Resource, link *domain.ResourceLink, paste *domain.PasteResource) error
+	CreateSecretLink(ctx context.Context, res *domain.Resource, link *domain.ResourceLink, secret *domain.SecretResource) error
 	ResolveLink(ctx context.Context, domainID uuid.UUID, slug string) (*ResolvedRedirect, error)
 	ResolvePaste(ctx context.Context, domainID uuid.UUID, slug string) (*ResolvedPaste, error)
+	ResolveSecret(ctx context.Context, domainID uuid.UUID, slug string) (*ResolvedSecret, error)
+	ConsumeSecret(ctx context.Context, resourceID uuid.UUID) (*domain.SecretResource, error)
 	GetLinkByID(ctx context.Context, id uuid.UUID) (*domain.ResourceLink, error)
 	GetResourceByID(ctx context.Context, id uuid.UUID) (*domain.Resource, error)
 	IncrementAccessCount(ctx context.Context, resourceID uuid.UUID) error
