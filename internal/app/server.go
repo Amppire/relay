@@ -18,6 +18,7 @@ import (
 	"github.com/relay/relay/internal/platform/analytics"
 	"github.com/relay/relay/internal/platform/cache"
 	"github.com/relay/relay/internal/platform/db"
+	"github.com/relay/relay/internal/platform/storage"
 )
 
 type Config struct {
@@ -56,8 +57,20 @@ func RunServer(cfg Config) error {
 	authService := services.NewAuthService(repo)
 	auditService := services.NewAuditService(repo)
 
+	diskStore, err := storage.NewLocalDiskStore("data/storage")
+	if err != nil {
+		return fmt.Errorf("init disk store: %w", err)
+	}
+	fileService := services.NewFileService(repo, diskStore, cfg.DefaultBaseURL)
+	requestService := services.NewRequestService(repo, cfg.DefaultBaseURL)
+	webhookDispatcher := services.NewWebhookDispatcher(repo)
+
 	authMw := middleware.NewAuthMiddleware(authService)
-	apiHandler := handlers.NewAPIHandler(linkService, pasteService, secretService, policyService, authService, auditService)
+	apiHandler := handlers.NewAPIHandler(
+		linkService, pasteService, secretService, policyService,
+		fileService, requestService, webhookDispatcher,
+		authService, auditService,
+	)
 
 	r := chi.NewRouter()
 	r.Use(chiMiddleware.RequestID)
@@ -80,9 +93,15 @@ func RunServer(cfg Config) error {
 		r.With(authMw.OptionalAuth).Post("/secrets", apiHandler.CreateSecret)
 		r.With(authMw.OptionalAuth).Get("/secrets/{slug}", apiHandler.GetSecretPayload)
 
-		// Access Policies
+		// Encrypted Files & Asymmetric Requests
+		r.With(authMw.OptionalAuth).Post("/files", apiHandler.UploadFile)
+		r.With(authMw.OptionalAuth).Post("/requests", apiHandler.CreateRequestPortal)
+		r.Post("/requests/{slug}/fulfill", apiHandler.FulfillRequest)
+
+		// Access Policies & Webhooks
 		r.With(authMw.RequireScope("policy:write")).Post("/policies", apiHandler.CreatePolicy)
 		r.With(authMw.RequireScope("policy:read")).Get("/policies", apiHandler.ListPolicies)
+		r.With(authMw.RequireScope("webhook:write")).Post("/webhooks", apiHandler.CreateWebhook)
 
 		// API Keys management
 		r.Post("/api-keys", apiHandler.CreateAPIKey)
@@ -90,6 +109,9 @@ func RunServer(cfg Config) error {
 		// Audit logs
 		r.With(authMw.RequireScope("audit:read")).Get("/audit", apiHandler.ListAuditLogs)
 	})
+
+	// Download encrypted file stream
+	r.Get("/f/{slug}", apiHandler.DownloadFile)
 
 	// Paste viewer & raw export
 	r.Get("/p/{slug}", apiHandler.GetPasteHandler)

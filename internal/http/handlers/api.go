@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"net/http"
 	"strings"
 
@@ -16,12 +18,15 @@ import (
 )
 
 type APIHandler struct {
-	linkService   *services.LinkService
-	pasteService  *services.PasteService
-	secretService *services.SecretService
-	policyService *services.PolicyService
-	authService   *services.AuthService
-	auditService  *services.AuditService
+	linkService       *services.LinkService
+	pasteService      *services.PasteService
+	secretService     *services.SecretService
+	policyService     *services.PolicyService
+	fileService       *services.FileService
+	requestService    *services.RequestService
+	webhookDispatcher *services.WebhookDispatcher
+	authService       *services.AuthService
+	auditService      *services.AuditService
 }
 
 func NewAPIHandler(
@@ -29,16 +34,22 @@ func NewAPIHandler(
 	pasteService *services.PasteService,
 	secretService *services.SecretService,
 	policyService *services.PolicyService,
+	fileService *services.FileService,
+	requestService *services.RequestService,
+	webhookDispatcher *services.WebhookDispatcher,
 	authService *services.AuthService,
 	auditService *services.AuditService,
 ) *APIHandler {
 	return &APIHandler{
-		linkService:   linkService,
-		pasteService:  pasteService,
-		secretService: secretService,
-		policyService: policyService,
-		authService:   authService,
-		auditService:  auditService,
+		linkService:       linkService,
+		pasteService:      pasteService,
+		secretService:     secretService,
+		policyService:     policyService,
+		fileService:       fileService,
+		requestService:    requestService,
+		webhookDispatcher: webhookDispatcher,
+		authService:       authService,
+		auditService:      auditService,
 	}
 }
 
@@ -322,6 +333,151 @@ func (h *APIHandler) ListPolicies(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"policies": policies})
+}
+
+// POST /api/v1/files (multipart or binary encrypted stream)
+func (h *APIHandler) UploadFile(w http.ResponseWriter, r *http.Request) {
+	filename := r.Header.Get("X-Relay-Filename")
+	if filename == "" {
+		filename = "encrypted.bin"
+	}
+
+	var actorID *uuid.UUID
+	if apiKey := middleware.GetAPIKeyFromContext(r.Context()); apiKey != nil {
+		actorID = &apiKey.ID
+	}
+
+	link, shareURL, err := h.fileService.UploadEncryptedFile(r.Context(), services.CreateFileRequest{
+		Filename:    filename,
+		ContentType: r.Header.Get("Content-Type"),
+	}, r.Body, actorID)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"link_id":  link.ID,
+		"slug":     link.Slug,
+		"url":      shareURL,
+		"filename": filename,
+	})
+}
+
+// GET /f/{slug} (download encrypted stream)
+func (h *APIHandler) DownloadFile(w http.ResponseWriter, r *http.Request) {
+	slug := chi.URLParam(r, "slug")
+	if slug == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	hostname := r.Host
+	if strings.Contains(hostname, ":") {
+		hostname = strings.Split(hostname, ":")[0]
+	}
+
+	fileMeta, rc, err := h.fileService.DownloadEncryptedFile(r.Context(), hostname, slug)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotFound) || errors.Is(err, domain.ErrExpired) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	defer rc.Close()
+
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileMeta.Filename))
+	w.Header().Set("X-Relay-Checksum", fileMeta.SHA256Hash)
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, rc)
+}
+
+// POST /api/v1/requests (create request portal)
+func (h *APIHandler) CreateRequestPortal(w http.ResponseWriter, r *http.Request) {
+	var input services.CreateRequestPortalInput
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+
+	var actorID *uuid.UUID
+	if apiKey := middleware.GetAPIKeyFromContext(r.Context()); apiKey != nil {
+		actorID = &apiKey.ID
+	}
+
+	url, err := h.requestService.CreatePortal(r.Context(), input, actorID)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]string{"url": url})
+}
+
+// POST /api/v1/requests/{slug}/fulfill (recipient drops credentials)
+func (h *APIHandler) FulfillRequest(w http.ResponseWriter, r *http.Request) {
+	slug := chi.URLParam(r, "slug")
+	var req struct {
+		Payload string `json:"payload"`       // Base64
+		Key     string `json:"encrypted_key"` // Base64
+		Nonce   string `json:"nonce"`         // Base64
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+
+	hostname := r.Host
+	if strings.Contains(hostname, ":") {
+		hostname = strings.Split(hostname, ":")[0]
+	}
+
+	payload, _ := base64.StdEncoding.DecodeString(req.Payload)
+	encKey, _ := base64.StdEncoding.DecodeString(req.Key)
+	nonce, _ := base64.StdEncoding.DecodeString(req.Nonce)
+
+	err := h.requestService.SubmitSecretToPortal(r.Context(), hostname, slug, payload, encKey, nonce)
+	if err != nil {
+		if errors.Is(err, domain.ErrRequestAlreadyFulfilled) {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "request portal has already been fulfilled"})
+			return
+		}
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "fulfilled"})
+}
+
+// POST /api/v1/webhooks
+func (h *APIHandler) CreateWebhook(w http.ResponseWriter, r *http.Request) {
+	var req services.CreateWebhookRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid json body"}`, http.StatusBadRequest)
+		return
+	}
+
+	wh, err := h.webhookDispatcher.RegisterWebhook(r.Context(), req)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(wh)
 }
 
 // GET /api/v1/audit

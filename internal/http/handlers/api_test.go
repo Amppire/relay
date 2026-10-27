@@ -19,6 +19,7 @@ import (
 	"github.com/relay/relay/internal/platform/cache"
 	"github.com/relay/relay/internal/platform/crypto"
 	"github.com/relay/relay/internal/platform/db"
+	"github.com/relay/relay/internal/platform/storage"
 )
 
 func setupTestRouter(t *testing.T, dbPath string) (http.Handler, *db.SQLiteRepository, func()) {
@@ -39,8 +40,17 @@ func setupTestRouter(t *testing.T, dbPath string) (http.Handler, *db.SQLiteRepos
 	authService := services.NewAuthService(repo)
 	auditService := services.NewAuditService(repo)
 
+	diskStore, _ := storage.NewLocalDiskStore("test_data/storage")
+	fileService := services.NewFileService(repo, diskStore, "http://localhost:8080")
+	requestService := services.NewRequestService(repo, "http://localhost:8080")
+	webhookDispatcher := services.NewWebhookDispatcher(repo)
+
 	authMw := middleware.NewAuthMiddleware(authService)
-	apiHandler := handlers.NewAPIHandler(linkService, pasteService, secretService, policyService, authService, auditService)
+	apiHandler := handlers.NewAPIHandler(
+		linkService, pasteService, secretService, policyService,
+		fileService, requestService, webhookDispatcher,
+		authService, auditService,
+	)
 
 	r := chi.NewRouter()
 	r.Route("/api/v1", func(r chi.Router) {
@@ -48,11 +58,16 @@ func setupTestRouter(t *testing.T, dbPath string) (http.Handler, *db.SQLiteRepos
 		r.With(authMw.OptionalAuth).Post("/pastes", apiHandler.CreatePaste)
 		r.With(authMw.OptionalAuth).Post("/secrets", apiHandler.CreateSecret)
 		r.With(authMw.OptionalAuth).Get("/secrets/{slug}", apiHandler.GetSecretPayload)
+		r.With(authMw.OptionalAuth).Post("/files", apiHandler.UploadFile)
+		r.With(authMw.OptionalAuth).Post("/requests", apiHandler.CreateRequestPortal)
+		r.Post("/requests/{slug}/fulfill", apiHandler.FulfillRequest)
 		r.With(authMw.RequireScope("policy:write")).Post("/policies", apiHandler.CreatePolicy)
 		r.With(authMw.RequireScope("policy:read")).Get("/policies", apiHandler.ListPolicies)
+		r.With(authMw.RequireScope("webhook:write")).Post("/webhooks", apiHandler.CreateWebhook)
 		r.Post("/api-keys", apiHandler.CreateAPIKey)
 		r.With(authMw.RequireScope("audit:read")).Get("/audit", apiHandler.ListAuditLogs)
 	})
+	r.Get("/f/{slug}", apiHandler.DownloadFile)
 	r.Get("/p/{slug}", apiHandler.GetPasteHandler)
 	r.Get("/p/{slug}/raw", apiHandler.GetPasteHandler)
 	r.Get("/{slug}", apiHandler.RedirectHandler)
@@ -357,5 +372,90 @@ func TestStructuredPolicyEnforcement(t *testing.T) {
 
 	if allowedRec.Code != http.StatusFound {
 		t.Errorf("expected 302 Found for authorized IP within 10.0.0.0/8, got %d", allowedRec.Code)
+	}
+}
+
+
+func TestEncryptedFileUploadAndDownload(t *testing.T) {
+	router, _, cleanup := setupTestRouter(t, "test_files.db")
+	defer func() {
+		cleanup()
+		_ = os.RemoveAll("test_data")
+	}()
+
+	fileContent := []byte("confidential backup data 1234567890")
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/files", bytes.NewReader(fileContent))
+	req.Header.Set("X-Relay-Filename", "backup.sql.enc")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for file upload, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var uploadResp map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &uploadResp)
+	slug := uploadResp["slug"].(string)
+
+	// Download file
+	downReq := httptest.NewRequest(http.MethodGet, "/f/"+slug, nil)
+	downRec := httptest.NewRecorder()
+	router.ServeHTTP(downRec, downReq)
+
+	if downRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for file download, got %d", downRec.Code)
+	}
+
+	if !bytes.Equal(downRec.Body.Bytes(), fileContent) {
+		t.Errorf("downloaded bytes mismatch with uploaded bytes")
+	}
+}
+
+func TestAsymmetricRequestPortal(t *testing.T) {
+	router, _, cleanup := setupTestRouter(t, "test_requests.db")
+	defer cleanup()
+
+	// 1. Requester generates X25519 keypair
+	privKey, pubKey, err := crypto.GenerateAsymmetricKeyPair()
+	if err != nil {
+		t.Fatalf("failed to generate keypair: %v", err)
+	}
+	_ = privKey
+
+	// 2. Create collection portal
+	pReqBody, _ := json.Marshal(services.CreateRequestPortalInput{
+		PublicKey: pubKey,
+		Title:     "API Keys Request",
+		Slug:      "drop-keys",
+	})
+	pReq := httptest.NewRequest(http.MethodPost, "/api/v1/requests", bytes.NewReader(pReqBody))
+	pRec := httptest.NewRecorder()
+	router.ServeHTTP(pRec, pReq)
+
+	if pRec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for request portal, got %d: %s", pRec.Code, pRec.Body.String())
+	}
+
+	// 3. Sender drops secret into portal
+	dropBody, _ := json.Marshal(map[string]string{
+		"payload":       base64.StdEncoding.EncodeToString([]byte("cipher-credentials")),
+		"encrypted_key": base64.StdEncoding.EncodeToString([]byte("wrapped-key")),
+		"nonce":         base64.StdEncoding.EncodeToString([]byte("nonce1234567")),
+	})
+	dropReq := httptest.NewRequest(http.MethodPost, "/api/v1/requests/drop-keys/fulfill", bytes.NewReader(dropBody))
+	dropRec := httptest.NewRecorder()
+	router.ServeHTTP(dropRec, dropReq)
+
+	if dropRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for fulfill, got %d: %s", dropRec.Code, dropRec.Body.String())
+	}
+
+	// 4. Second fulfill must be rejected (409 Conflict - single-use portal)
+	dropRec2 := httptest.NewRecorder()
+	dropReq2 := httptest.NewRequest(http.MethodPost, "/api/v1/requests/drop-keys/fulfill", bytes.NewReader(dropBody))
+	router.ServeHTTP(dropRec2, dropReq2)
+
+	if dropRec2.Code != http.StatusConflict {
+		t.Errorf("expected 409 Conflict on duplicate fulfill, got %d", dropRec2.Code)
 	}
 }
