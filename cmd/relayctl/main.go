@@ -37,6 +37,8 @@ func main() {
 		runSecretCmd(os.Args[2:])
 	case "keys":
 		runKeysCmd(os.Args[2:])
+	case "config":
+		runConfigCmd(os.Args[2:])
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -126,11 +128,13 @@ func runShortenCmd(args []string) {
 		os.Exit(1)
 	}
 
-	url := strings.TrimRight(*endpoint, "/") + "/api/v1/links"
+	targetEndpoint, targetToken := ResolveTarget(*endpoint, *token)
+
+	url := strings.TrimRight(targetEndpoint, "/") + "/api/v1/links"
 	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
 	req.Header.Set("Content-Type", "application/json")
-	if *token != "" {
-		req.Header.Set("Authorization", "Bearer "+*token)
+	if targetToken != "" {
+		req.Header.Set("Authorization", "Bearer "+targetToken)
 	}
 
 	resp, err := http.DefaultClient.Do(req)

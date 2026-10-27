@@ -55,6 +55,117 @@ func (r *SQLiteRepository) Close() error {
 	return r.db.Close()
 }
 
+func (r *SQLiteRepository) CreatePolicy(ctx context.Context, policy *domain.Policy) error {
+	rulesJSON, err := json.Marshal(policy.Rules)
+	if err != nil {
+		return fmt.Errorf("marshal policy rules: %w", err)
+	}
+
+	_, err = r.db.ExecContext(ctx, `
+		INSERT INTO policies (id, workspace_id, name, description, version, rules, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, policy.ID.String(), policy.WorkspaceID.String(), policy.Name, policy.Description, policy.Version, string(rulesJSON), policy.CreatedAt, policy.UpdatedAt)
+	return err
+}
+
+func (r *SQLiteRepository) GetPolicyByID(ctx context.Context, id uuid.UUID) (*domain.Policy, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT id, workspace_id, name, description, version, rules, created_at, updated_at
+		FROM policies
+		WHERE id = ?
+	`, id.String())
+
+	var (
+		pID, wsID, name, rulesStr string
+		desc                      *string
+		ver                       int
+		created, updated          time.Time
+	)
+
+	if err := row.Scan(&pID, &wsID, &name, &desc, &ver, &rulesStr, &created, &updated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, err
+	}
+
+	parsedID, _ := uuid.Parse(pID)
+	parsedWsID, _ := uuid.Parse(wsID)
+
+	rules, err := domain.ParsePolicyRules(rulesStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse policy rules: %w", err)
+	}
+
+	var descStr string
+	if desc != nil {
+		descStr = *desc
+	}
+
+	return &domain.Policy{
+		ID:          parsedID,
+		WorkspaceID: parsedWsID,
+		Name:        name,
+		Description: descStr,
+		Version:     ver,
+		Rules:       rules,
+		CreatedAt:   created,
+		UpdatedAt:   updated,
+	}, nil
+}
+
+func (r *SQLiteRepository) ListPolicies(ctx context.Context, workspaceID uuid.UUID) ([]domain.Policy, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, workspace_id, name, description, version, rules, created_at, updated_at
+		FROM policies
+		WHERE workspace_id = ?
+		ORDER BY created_at DESC
+	`, workspaceID.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []domain.Policy
+	for rows.Next() {
+		var (
+			pID, wsID, name, rulesStr string
+			desc                      *string
+			ver                       int
+			created, updated          time.Time
+		)
+		if err := rows.Scan(&pID, &wsID, &name, &desc, &ver, &rulesStr, &created, &updated); err != nil {
+			return nil, err
+		}
+
+		pid, _ := uuid.Parse(pID)
+		pwid, _ := uuid.Parse(wsID)
+		rules, _ := domain.ParsePolicyRules(rulesStr)
+
+		var descStr string
+		if desc != nil {
+			descStr = *desc
+		}
+
+		list = append(list, domain.Policy{
+			ID:          pid,
+			WorkspaceID: pwid,
+			Name:        name,
+			Description: descStr,
+			Version:     ver,
+			Rules:       rules,
+			CreatedAt:   created,
+			UpdatedAt:   updated,
+		})
+	}
+	return list, nil
+}
+
+func (r *SQLiteRepository) DeletePolicy(ctx context.Context, id uuid.UUID) error {
+	_, err := r.db.ExecContext(ctx, "DELETE FROM policies WHERE id = ?", id.String())
+	return err
+}
+
 func (r *SQLiteRepository) GetOrCreateDefaultWorkspace(ctx context.Context) (*domain.Workspace, *domain.Domain, error) {
 	var ws domain.Workspace
 	var wsID, wsName, wsSlug string
@@ -166,13 +277,18 @@ func (r *SQLiteRepository) CreateSecretLink(ctx context.Context, res *domain.Res
 	defer tx.Rollback()
 
 	// Insert resource
+	var policyIDStr *string
+	if res.PolicyID != nil {
+		s := res.PolicyID.String()
+		policyIDStr = &s
+	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO resources (
-			id, workspace_id, created_by, type, name, description, status,
+			id, workspace_id, created_by, policy_id, type, name, description, status,
 			created_at, updated_at, expires_at, max_accesses, access_count, metadata
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		res.ID.String(), res.WorkspaceID.String(), nil, string(res.Type), res.Name, res.Description,
+		res.ID.String(), res.WorkspaceID.String(), nil, policyIDStr, string(res.Type), res.Name, res.Description,
 		string(res.Status), res.CreatedAt, res.UpdatedAt, res.ExpiresAt, res.MaxAccesses, res.AccessCount, "{}",
 	)
 	if err != nil {
@@ -373,13 +489,18 @@ func (r *SQLiteRepository) CreateRedirectLink(ctx context.Context, res *domain.R
 	defer tx.Rollback()
 
 	// Insert resource
+	var policyIDStr *string
+	if res.PolicyID != nil {
+		s := res.PolicyID.String()
+		policyIDStr = &s
+	}
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO resources (
-			id, workspace_id, created_by, type, name, description, status,
+			id, workspace_id, created_by, policy_id, type, name, description, status,
 			created_at, updated_at, expires_at, max_accesses, access_count, metadata
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		res.ID.String(), res.WorkspaceID.String(), nil, string(res.Type), res.Name, res.Description,
+		res.ID.String(), res.WorkspaceID.String(), nil, policyIDStr, string(res.Type), res.Name, res.Description,
 		string(res.Status), res.CreatedAt, res.UpdatedAt, res.ExpiresAt, res.MaxAccesses, res.AccessCount, "{}",
 	)
 	if err != nil {
@@ -413,7 +534,7 @@ func (r *SQLiteRepository) CreateRedirectLink(ctx context.Context, res *domain.R
 func (r *SQLiteRepository) ResolveLink(ctx context.Context, domainID uuid.UUID, slug string) (*ports.ResolvedRedirect, error) {
 	row := r.db.QueryRowContext(ctx, `
 		SELECT 
-			r.id, r.workspace_id, r.type, r.status, r.created_at, r.updated_at, r.expires_at, r.revoked_at, r.max_accesses, r.access_count,
+			r.id, r.workspace_id, r.policy_id, r.type, r.status, r.created_at, r.updated_at, r.expires_at, r.revoked_at, r.max_accesses, r.access_count,
 			l.id, l.resource_id, l.domain_id, l.slug, l.enabled, l.created_at,
 			red.destination_url, red.redirect_code, red.preserve_query, red.fallback_url
 		FROM resource_links l
@@ -424,6 +545,7 @@ func (r *SQLiteRepository) ResolveLink(ctx context.Context, domainID uuid.UUID, 
 
 	var (
 		rID, rWsID, rType, rStatus string
+		rPolicyID                  *string
 		rCreated, rUpdated         time.Time
 		rExpires, rRevoked         *time.Time
 		rMax                       *int64
@@ -440,7 +562,7 @@ func (r *SQLiteRepository) ResolveLink(ctx context.Context, domainID uuid.UUID, 
 	)
 
 	err := row.Scan(
-		&rID, &rWsID, &rType, &rStatus, &rCreated, &rUpdated, &rExpires, &rRevoked, &rMax, &rAccessCount,
+		&rID, &rWsID, &rPolicyID, &rType, &rStatus, &rCreated, &rUpdated, &rExpires, &rRevoked, &rMax, &rAccessCount,
 		&lID, &lResID, &lDomID, &lSlug, &lEnabled, &lCreated,
 		&destURL, &redirCode, &presQuery, &fallbackURL,
 	)
@@ -456,9 +578,16 @@ func (r *SQLiteRepository) ResolveLink(ctx context.Context, domainID uuid.UUID, 
 	parsedLID, _ := uuid.Parse(lID)
 	parsedLDomID, _ := uuid.Parse(lDomID)
 
+	var parsedPolicyID *uuid.UUID
+	if rPolicyID != nil {
+		u, _ := uuid.Parse(*rPolicyID)
+		parsedPolicyID = &u
+	}
+
 	res := &domain.Resource{
 		ID:          parsedRID,
 		WorkspaceID: parsedRWsID,
+		PolicyID:    parsedPolicyID,
 		Type:        domain.ResourceType(rType),
 		Status:      domain.ResourceStatus(rStatus),
 		CreatedAt:   rCreated,

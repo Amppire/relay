@@ -18,6 +18,7 @@ type CreateLinkRequest struct {
 	Slug           string     `json:"slug,omitempty"`
 	Hostname       string     `json:"hostname,omitempty"`
 	RedirectCode   int        `json:"redirect_code,omitempty"`
+	PolicyID       *uuid.UUID `json:"policy_id,omitempty"`
 	ExpiresAt      *time.Time `json:"expires_at,omitempty"`
 	MaxAccesses    *int64     `json:"max_accesses,omitempty"`
 	FallbackURL    *string    `json:"fallback_url,omitempty"`
@@ -36,14 +37,16 @@ type CreateLinkResponse struct {
 
 type LinkService struct {
 	repo            ports.Repository
+	policyService   *PolicyService
 	cache           ports.Cache
 	analyticsBuffer ports.AnalyticsBuffer
 	defaultBaseURL  string
 }
 
-func NewLinkService(repo ports.Repository, cache ports.Cache, analytics ports.AnalyticsBuffer, defaultBaseURL string) *LinkService {
+func NewLinkService(repo ports.Repository, policyService *PolicyService, cache ports.Cache, analytics ports.AnalyticsBuffer, defaultBaseURL string) *LinkService {
 	return &LinkService{
 		repo:            repo,
+		policyService:   policyService,
 		cache:           cache,
 		analyticsBuffer: analytics,
 		defaultBaseURL:  strings.TrimRight(defaultBaseURL, "/"),
@@ -89,6 +92,7 @@ func (s *LinkService) CreateRedirect(ctx context.Context, req CreateLinkRequest)
 	res := &domain.Resource{
 		ID:          resourceID,
 		WorkspaceID: ws.ID,
+		PolicyID:    req.PolicyID,
 		Type:        domain.ResourceTypeRedirect,
 		Status:      domain.StatusActive,
 		CreatedAt:   now,
@@ -176,6 +180,22 @@ func (s *LinkService) ResolveAndTrack(ctx context.Context, hostname, slug string
 			return *resolved.Redirect.FallbackURL, 302, nil
 		}
 		return "", 0, err
+	}
+
+	// Policy enforcement
+	if s.policyService != nil {
+		evalCtx := domain.EvaluationContext{
+			ClientIP:    clientIP,
+			CurrentTime: now,
+			AccessCount: resolved.Resource.AccessCount,
+		}
+		allowed, _, err := s.policyService.EvaluateAccess(ctx, resolved.Resource, evalCtx)
+		if !allowed || err != nil {
+			if resolved.Redirect.FallbackURL != nil {
+				return *resolved.Redirect.FallbackURL, 302, nil
+			}
+			return "", 0, domain.ErrPolicyDenied
+		}
 	}
 
 	// Increment access count asynchronously or atomically
